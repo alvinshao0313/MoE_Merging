@@ -5,19 +5,27 @@ from collections import defaultdict, OrderedDict
 import re
 from models.new_moe import LoRAExpert
 from models.deepseek.v1.modeling_deepseekv1 import DeepseekMoE, DeepseekMLP
+from utils.model_utils import MIXTRAL_MODEL, DEEPSEEKV1_MODEL, QWEN2_MOE_MODEL, QWEN3_MOE_MODEL, DEEPSEEKV2_MODEL
+from transformers.models.mixtral.modeling_mixtral import MixtralBlockSparseTop2MLP
 
 
-def get_experts(layer, exclude_expert_names_regex: list):
+def get_experts(layer, exclude_expert_names_regex: list, model_type):
     """
     get the experts in a layer
     :param layer: a layer of the model
     :return: list, experts in the layer
     """
+    if model_type == DEEPSEEKV1_MODEL:
+        ExpertClass = DeepseekMLP
+    elif model_type == MIXTRAL_MODEL:
+        ExpertClass = MixtralBlockSparseTop2MLP
     experts = []
+    see = {}
     for name, module in layer.named_modules():
         exclude = any([re.search(exclude_pattern, name) for exclude_pattern in exclude_expert_names_regex])
-        if not exclude and isinstance(module, DeepseekMLP):
+        if not exclude and isinstance(module, ExpertClass):
             experts.append(module)
+            see[name] = module
     return experts
 
 

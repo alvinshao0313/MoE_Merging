@@ -6,7 +6,7 @@ import transformers
 def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
 
     if hf_token is None:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model)
     else:
         tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False, use_auth_token=hf_token)
 

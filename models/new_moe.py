@@ -9,18 +9,13 @@ class LoRAExpert(nn.Module):
     def __init__(self, expert: nn.Module, hidden_size=None, intermediate_size=None, rank=None):
         super().__init__()
         self.config = expert.config
-        self.hidden_size = expert.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = expert.intermediate_size if intermediate_size is None else intermediate_size
-
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        assert rank is not None, "Rank must be specified for LoRAExpert"
         self.rank = rank
-        if self.rank is None:
-            self.gate_proj = expert.gate_proj
-            self.up_proj = expert.up_proj
-            self.down_proj = expert.down_proj
-        else:
-            self.gate_proj_lora_a, self.gate_proj_lora_b = self.svd_init(expert.gate_proj)
-            self.up_proj_lora_a, self.up_proj_lora_b = self.svd_init(expert.up_proj)
-            self.down_proj_lora_a, self.down_proj_lora_b = self.svd_init(expert.down_proj)
+        self.gate_proj_lora_a, self.gate_proj_lora_b = self.svd_init(expert.gate_proj)
+        self.up_proj_lora_a, self.up_proj_lora_b = self.svd_init(expert.up_proj)
+        self.down_proj_lora_a, self.down_proj_lora_b = self.svd_init(expert.down_proj)
         self.act_fn = ACT2FN[expert.config.hidden_act]
 
     def svd_init(self, linear: nn.Module):
@@ -135,3 +130,73 @@ class MergedDeepseekMoE(nn.Module):
             expert_cache = expert_cache.scatter_reduce(
                 0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out, reduce='sum')
         return expert_cache
+
+
+class MergedMixtralSparseMoeBlock(nn.Module):
+    """
+    This implementation is
+    strictly equivalent to standard MoE with full capacity (no
+    dropped tokens). It's faster since it formulates MoE operations
+    in terms of block-sparse operations to accommodate imbalanced
+    assignments of tokens to experts, whereas standard MoE either
+    (1) drop tokens at the cost of reduced performance or (2) set
+    capacity factor to number of experts and thus waste computation
+    and memory on padding.
+    """
+
+    def __init__(self, mixtral_moe):
+        super().__init__()
+        self.hidden_dim = mixtral_moe.hidden_size
+        self.ffn_dim = mixtral_moe.intermediate_size
+        self.num_experts = mixtral_moe.num_local_experts
+        self.top_k = mixtral_moe.num_experts_per_tok
+
+        # gating
+        self.gate = mixtral_moe.gate
+
+        self.experts = mixtral_moe.experts
+        # Jitter parameters
+        self.jitter_noise = mixtral_moe.router_jitter_noise
+
+        self.avg_expert = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """ """
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        # if self.training and self.jitter_noise > 0:
+        #     hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits = self.gate(hidden_states)
+
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be sollicitated
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        expert_hitted = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=True)[0].tolist()
+        for expert_idx in expert_hitted:
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx])
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+
+            # However `index_add_` only support torch tensors for indexing so we'll use
+            # the `top_x` tensor here.
+            final_hidden_states = final_hidden_states.index_add(0, top_x, current_hidden_states.to(hidden_states.dtype))
+            if self.avg_expert is not None:
+                final_hidden_states = final_hidden_states.index_add(0, top_x, self.avg_expert(current_state))
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
